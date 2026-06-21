@@ -8,10 +8,18 @@ See :mod:`copilot.browser` for the Playwright-backed fallback.
 
 import json
 import time
+from select import select
 from typing import Dict, Optional
 from urllib.parse import quote
 
+from curl_cffi.const import CurlECode, CurlInfo
+from curl_cffi.curl import CurlError
 from curl_cffi.requests import Session, CurlWsFlag
+
+# curl_cffi's WebSocket.recv() loops on CURLE_AGAIN forever (select() then retry)
+# and never returns on an idle socket, so we drive the fragment loop ourselves to
+# honour a deadline. CURL_SOCKET_BAD is libcurl's "no active socket" sentinel.
+_CURL_SOCKET_BAD = -1
 
 from .challenges import solve_copilot_challenge, solve_hashcash
 from .models import AbstractProvider, Conversation, ImageResponse, ImageType
@@ -125,24 +133,34 @@ class Copilot(AbstractProvider):
             wss.send(send_frame, CurlWsFlag.TEXT)
             yield from self._read_stream(wss, send_frame, timeout)
 
-    def _read_stream(self, wss, send_frame: bytes, timeout: int):
-        """Consume chat-socket frames, solving challenges, yielding text/images."""
+    def _read_stream(self, wss, send_frame: bytes, timeout: int, idle_timeout: int = 60):
+        """Consume chat-socket frames, solving challenges, yielding text/images.
+
+        ``idle_timeout`` bounds how long we wait for the *next* frame: the chat
+        backend normally answers within a second, so prolonged silence means a
+        stalled socket (or a challenge we failed to answer) — we raise rather
+        than block for the full ``timeout``.
+        """
         buffer = b""
         is_started = False
         answered = False
         image_prompt = None
         last_msg = None
 
-        deadline = time.time() + timeout
+        overall_deadline = time.time() + timeout
         while True:
+            idle_deadline = time.time() + idle_timeout
             try:
-                chunk = wss.recv()[0]
+                chunk = self._recv_frame(wss, min(overall_deadline, idle_deadline))
             except Exception:
-                break
-            if not chunk:
-                if time.time() > deadline:
-                    break
-                continue
+                break  # socket closed/errored -> end of stream
+            if chunk is None:  # deadline passed with no frame
+                if time.time() >= overall_deadline:
+                    raise TimeoutError(f"Copilot stream exceeded {timeout}s")
+                raise TimeoutError(
+                    f"Copilot chat socket went silent for {idle_timeout}s; "
+                    f"last frame was {last_msg!r}."
+                )
 
             buffer += chunk if isinstance(chunk, (bytes, bytearray)) else chunk.encode()
             messages, buffer = drain_json(buffer)
@@ -151,15 +169,21 @@ class Copilot(AbstractProvider):
                 event = msg.get("event")
                 if event == "challenge" and not answered:
                     token = self._solve_challenge(msg)
-                    if token is not None:
-                        wss.send(json.dumps({
-                            "event": "challengeResponse",
-                            "token": token,
-                            "method": msg.get("method"),
-                        }).encode(), CurlWsFlag.TEXT)
-                        answered = True
-                        # The client re-sends the held message after a challenge.
-                        wss.send(send_frame, CurlWsFlag.TEXT)
+                    if token is None:
+                        raise RuntimeError(
+                            f"Unsolvable Copilot challenge (method={msg.get('method')!r}). "
+                            "Microsoft may have escalated to a browser-only challenge; "
+                            "fall back to copilot.browser.BrowserCopilot."
+                        )
+                    wss.send(json.dumps({
+                        "event": "challengeResponse",
+                        "token": token,
+                        "method": msg.get("method"),
+                        "id": msg.get("id"),
+                    }).encode(), CurlWsFlag.TEXT)
+                    answered = True
+                    # The client re-sends the held message after a challenge.
+                    wss.send(send_frame, CurlWsFlag.TEXT)
                 elif event == "appendText":
                     is_started = True
                     yield msg.get("text")
@@ -184,15 +208,50 @@ class Copilot(AbstractProvider):
             raise RuntimeError(f"Invalid response: {last_msg}")
 
     @staticmethod
+    def _recv_frame(wss, deadline: float):
+        """Block for one complete WS frame, or return ``None`` past ``deadline``.
+
+        Reassembles libcurl's fragments like ``curl_cffi``'s own ``recv()`` but
+        breaks out of the ``CURLE_AGAIN`` wait once ``deadline`` (epoch seconds)
+        is reached, so an idle socket can't hang us indefinitely. Non-AGAIN curl
+        errors (e.g. a closed connection) propagate to the caller.
+        """
+        sock_fd = wss.curl.getinfo(CurlInfo.ACTIVESOCKET)
+        if sock_fd == _CURL_SOCKET_BAD:
+            raise ConnectionError("WebSocket has no active socket")
+        chunks = []
+        while True:
+            try:
+                chunk, frame = wss.recv_fragment()
+                chunks.append(chunk)
+                if frame.bytesleft == 0 and frame.flags & CurlWsFlag.CONT == 0:
+                    return b"".join(chunks)
+            except CurlError as e:
+                if e.code != CurlECode.AGAIN:
+                    raise
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    return None
+                select([sock_fd], [], [], min(0.5, remaining))
+
+    @staticmethod
     def _solve_challenge(msg: dict):
-        """Return the challenge response token, or None if unsupported."""
+        """Return the challenge-response token, or ``None`` if we can't solve it.
+
+        Copilot's chat socket precedes the answer with a challenge frame that the
+        client must acknowledge. An *empty* challenge (no ``method``/``parameter``)
+        only needs an acknowledging response, so we return an empty token; the
+        proof-of-work variants are computed in :mod:`copilot.challenges`. A
+        ``None`` return means the challenge needs a browser-solved token (e.g. a
+        Cloudflare Turnstile) and the caller should surface that.
+        """
         method = msg.get("method")
         parameter = msg.get("parameter")
-        if not parameter:
-            return None
-        if method == "hashcash":
+        if not method and not parameter:
+            return ""  # empty/no-op challenge: just acknowledge it
+        if method == "hashcash" and parameter:
             return solve_hashcash(parameter)
-        if method == "copilot":
+        if method == "copilot" and parameter:
             return solve_copilot_challenge(parameter)
-        # 'cloudflare' (Turnstile) needs a browser-solved token; unsupported here.
+        # 'cloudflare' (Turnstile) / unknown PoW needs a browser-solved token.
         return None

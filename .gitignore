@@ -11,4 +11,7 @@ docs/
 
 # Local config / secrets
 config.json
+
+# Dev files
 test.py
+main.py
