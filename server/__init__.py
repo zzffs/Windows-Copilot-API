@@ -24,7 +24,7 @@ import os
 from .api import app as _api
 
 
-def app(host="127.0.0.1", port=8000) -> None:
+def app(host=None, port=None) -> None:
     """Start the server (blocks while uvicorn runs).
 
     On first run (no saved session) this opens a browser for interactive sign-in
@@ -34,8 +34,10 @@ def app(host="127.0.0.1", port=8000) -> None:
 
     from copilot.auth import load_auth
 
-    host = host or os.environ.get("HOST", "127.0.0.1")
-    port = port or int(os.environ.get("PORT", "8000"))
+    if host is None:
+        host = os.environ.get("HOST", "127.0.0.1")
+    if port is None:
+        port = int(os.environ.get("PORT", "8000"))
 
     # Ensure a signed-in Copilot session exists before we start serving. On the
     # very first run this triggers the interactive browser sign-in (instead of
