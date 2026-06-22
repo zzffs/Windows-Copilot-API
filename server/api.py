@@ -8,7 +8,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from copilot import CopilotClient
 
-from .config import MODEL_NAME
+from .config import MODEL_NAME, RATE_LIMIT_BURST, RATE_LIMIT_RPM
 from .openai_format import (
     completion_response,
     new_id,
@@ -16,10 +16,35 @@ from .openai_format import (
     stream_chunk,
 )
 from .prompt import messages_to_prompt
+from .ratelimit import TokenBucket
 from .schemas import ChatCompletionRequest
 
 app = FastAPI(title="Copilot OpenAI-compatible API", version="1.0.0")
 client = CopilotClient()
+
+# Self-imposed rate limit on top of the concurrency lock below: this caps
+# requests-per-minute, the lock caps requests-in-flight. See server/ratelimit.py.
+_rate_limiter = TokenBucket(RATE_LIMIT_RPM, RATE_LIMIT_BURST)
+
+
+def _rate_limited_response():
+    """Spend a token; return an OpenAI-shaped 429 if none left, else ``None``."""
+    allowed, wait = _rate_limiter.try_acquire()
+    if allowed:
+        return None
+    secs = max(1, round(wait))
+    return JSONResponse(
+        status_code=429,
+        headers={"Retry-After": str(secs)},
+        content={"error": {
+            "message": (
+                f"Rate limit exceeded (>{RATE_LIMIT_RPM:g} req/min). "
+                f"Retry in {secs}s."
+            ),
+            "type": "rate_limit_error",
+            "code": "rate_limit_exceeded",
+        }},
+    )
 
 # Copilot's per-account chat socket doesn't tolerate concurrent conversations
 # from one process (parallel requests error out or hang). This server bridges a
@@ -78,6 +103,12 @@ def chat_completions(req: ChatCompletionRequest):
             content={"error": {"message": "no text content in messages", "type": "invalid_request_error"}},
         )
     model = req.model or MODEL_NAME
+
+    # Enforce the per-minute ceiling before touching the upstream lock, so excess
+    # callers get a fast 429 instead of piling up behind the serialized queue.
+    limited = _rate_limited_response()
+    if limited is not None:
+        return limited
 
     if req.stream:
         return StreamingResponse(

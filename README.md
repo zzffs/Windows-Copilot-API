@@ -197,6 +197,39 @@ timeout — so the exact break point is flaky and may vary between runs.
 
 ---
 
+## Rate limiting
+
+Concurrency (above) is *how many at once*; the **rate limit** is *how many per
+minute, sustained*. Microsoft publishes none for consumer Copilot, so the bridge
+enforces a self-imposed one with a [token bucket](server/ratelimit.py): it caps
+accepted requests per minute and returns a standard `429` + `Retry-After` when
+you exceed it. Two env vars tune it:
+
+| Env var | Default | Meaning |
+| --- | --- | --- |
+| `RATE_LIMIT_RPM` | `12` | Requests/minute the bridge accepts. `0` disables the limit. |
+| `RATE_LIMIT_BURST` | `4` | How many requests may go back-to-back before pacing kicks in. |
+
+```bash
+RATE_LIMIT_RPM=20 RATE_LIMIT_BURST=5 python app.py   # raise it; 0 to disable
+```
+
+The default 12 rpm sits safely below the ~15 rpm where a single account starts
+seeing upstream `502`s. To find *your* ceiling, run the server with the limiter
+off (`RATE_LIMIT_RPM=0`) and push the probe until failures appear:
+
+```bash
+python tests/ratelimit.py --rpm 20 --minutes 3
+```
+
+**On the client side, use exponential backoff.** Both `429` (bridge limit) and
+the occasional `502` (Copilot upstream hiccup) are transient — retry with
+growing delays (e.g. 1s, 2s, 4s) and they almost always clear. The official
+`openai` SDK does this automatically and honours `Retry-After`; with plain HTTP,
+add a few retries yourself.
+
+---
+
 ## Project layout
 
 | Path | What it does |
