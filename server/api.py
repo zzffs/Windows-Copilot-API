@@ -26,7 +26,7 @@ app = FastAPI(title="Copilot OpenAI-compatible API", version="1.0.0")
 # 503 (see ClearanceRequired handling below) so an operator can re-clear out of
 # band (`python -m copilot login`). Headless auto-solve is intentionally off:
 # it's unreliable on low-trust egress and a failed pass can wedge the session.
-client = CopilotClient(interactive_clear=False, headless_clear=False)
+client = CopilotClient(anonymous=True, interactive_clear=False, headless_clear=False)
 
 _CLEARANCE_HELP = (
     "Cloudflare clearance expired and could not be refreshed headlessly. "
