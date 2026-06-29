@@ -224,31 +224,29 @@ def _responses_stream(prompt: str, model: str, conversation_id=None):
     created = int(time.time())
     try:
         with _upstream_lock:
-            init = {"id": cid, "object": "response", "created_at": created, "model": model, "status": "in_progress", "incomplete_reason": None}
-            yield f"event: response.created\ndata: {json.dumps(init)}\n\n"
+            yield f"event: response.created\ndata: {json.dumps({'type': 'response.created', 'response': {'id': cid, 'object': 'response', 'created_at': created, 'model': model, 'status': 'in_progress', 'incomplete_reason': None}})}\n\n"
             item = {"type": "message", "id": msg_id, "role": "assistant", "status": "in_progress", "content": []}
-            yield f"event: response.output_item.added\ndata: {json.dumps(item)}\n\n"
-            part = {"type": "output_text", "text": ""}
-            yield f"event: response.content_part.added\ndata: {json.dumps(part)}\n\n"
+            yield f"event: response.output_item.added\ndata: {json.dumps({'type': 'response.output_item.added', 'output_index': 0, 'item': item})}\n\n"
+            yield f"event: response.content_part.added\ndata: {json.dumps({'type': 'response.content_part.added', 'item_id': msg_id, 'output_index': 0, 'part': {'type': 'output_text', 'text': ''}})}\n\n"
             stream = client.stream(prompt, conversation_id=conversation_id)
             full_text = ""
             for piece in stream:
                 if isinstance(piece, str) and piece:
                     full_text += piece
-                    delta = {"type": "output_text", "id": msg_id, "delta": piece}
-                    yield f"event: response.output_text.delta\ndata: {json.dumps(delta)}\n\n"
-            done = {"type": "output_text", "id": msg_id, "text": full_text}
-            yield f"event: response.output_text.done\ndata: {json.dumps(done)}\n\n"
-            yield f"event: response.content_part.done\ndata: {json.dumps(part)}\n\n"
-            yield f"event: response.output_item.done\ndata: {json.dumps(item)}\n\n"
-            final = {"id": cid, "object": "response", "created_at": created, "status": "completed", "model": model, "output": [item]}
-            yield f"event: response.completed\ndata: {json.dumps(final)}\n\n"
+                    yield f"event: response.output_text.delta\ndata: {json.dumps({'type': 'response.output_text.delta', 'item_id': msg_id, 'output_index': 0, 'delta': piece})}\n\n"
+            yield f"event: response.output_text.done\ndata: {json.dumps({'type': 'response.output_text.done', 'item_id': msg_id, 'output_index': 0, 'text': full_text})}\n\n"
+            yield f"event: response.content_part.done\ndata: {json.dumps({'type': 'response.content_part.done', 'item_id': msg_id, 'output_index': 0, 'part': {'type': 'output_text', 'text': full_text}})}\n\n"
+            item["content"] = [{"type": "output_text", "text": full_text}]
+            item["status"] = "completed"
+            yield f"event: response.output_item.done\ndata: {json.dumps({'type': 'response.output_item.done', 'output_index': 0, 'item': item})}\n\n"
+            final_resp = {"id": cid, "object": "response", "created_at": created, "status": "completed", "model": model, "output": [item]}
+            yield f"event: response.completed\ndata: {json.dumps({'type': 'response.completed', 'response': final_resp})}\n\n"
     except ClearanceRequired:
-        yield f"event: error\ndata: {json.dumps({'message': _CLEARANCE_HELP})}\n\n"
-        yield f"event: response.completed\ndata: {json.dumps({'id': cid, 'status': 'failed', 'error': {'message': _CLEARANCE_HELP}})}\n\n"
+        yield f"event: error\ndata: {json.dumps({'type': 'error', 'sequence_number': 0, 'error': {'message': _CLEARANCE_HELP}})}\n\n"
+        yield f"event: response.completed\ndata: {json.dumps({'type': 'response.failed', 'response': {'id': cid, 'status': 'failed', 'error': {'message': _CLEARANCE_HELP}}})}\n\n"
     except Exception as exc:
-        yield f"event: error\ndata: {json.dumps({'message': str(exc)})}\n\n"
-        yield f"event: response.completed\ndata: {json.dumps({'id': cid, 'status': 'failed', 'error': {'message': str(exc)}})}\n\n"
+        yield f"event: error\ndata: {json.dumps({'type': 'error', 'sequence_number': 0, 'error': {'message': str(exc)}})}\n\n"
+        yield f"event: response.completed\ndata: {json.dumps({'type': 'response.failed', 'response': {'id': cid, 'status': 'failed', 'error': {'message': str(exc)}}})}\n\n"
     yield "data: [DONE]\n\n"
 
 
