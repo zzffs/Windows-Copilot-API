@@ -218,23 +218,37 @@ def responses(req: dict):
 
 
 def _responses_stream(prompt: str, model: str, conversation_id=None):
-    """Stream /v1/responses as SSE events."""
+    """Stream /v1/responses as SSE events matching OpenAI Responses API."""
     cid = f"resp_{new_id()}"
+    msg_id = f"msg_{new_id()}"
     created = int(time.time())
     try:
         with _upstream_lock:
-            yield f"event: response.created\ndata: {json.dumps({'id': cid, 'object': 'response', 'created_at': created, 'model': model, 'status': 'in_progress'})}\n\n"
+            init = {"id": cid, "object": "response", "created_at": created, "model": model, "status": "in_progress", "incomplete_reason": None}
+            yield f"event: response.created\ndata: {json.dumps(init)}\n\n"
+            item = {"type": "message", "id": msg_id, "role": "assistant", "status": "in_progress", "content": []}
+            yield f"event: response.output_item.added\ndata: {json.dumps(item)}\n\n"
+            part = {"type": "output_text", "text": ""}
+            yield f"event: response.content_part.added\ndata: {json.dumps(part)}\n\n"
             stream = client.stream(prompt, conversation_id=conversation_id)
-            msg_id = f"msg_{new_id()}"
-            yield f"event: response.output_item.added\ndata: {json.dumps({'id': msg_id, 'type': 'message', 'role': 'assistant', 'content': []})}\n\n"
+            full_text = ""
             for piece in stream:
                 if isinstance(piece, str) and piece:
-                    yield f"event: response.output_text.delta\ndata: {json.dumps({'id': msg_id, 'delta': piece})}\n\n"
-            yield f"event: response.completed\ndata: {json.dumps({'id': cid, 'object': 'response', 'created_at': created, 'status': 'completed', 'model': model, 'output': [{'id': msg_id, 'type': 'message', 'role': 'assistant', 'content': [{'type': 'output_text', 'text': stream.conversation_id or ''}]}]})}\n\n"
+                    full_text += piece
+                    delta = {"type": "output_text", "id": msg_id, "delta": piece}
+                    yield f"event: response.output_text.delta\ndata: {json.dumps(delta)}\n\n"
+            done = {"type": "output_text", "id": msg_id, "text": full_text}
+            yield f"event: response.output_text.done\ndata: {json.dumps(done)}\n\n"
+            yield f"event: response.content_part.done\ndata: {json.dumps(part)}\n\n"
+            yield f"event: response.output_item.done\ndata: {json.dumps(item)}\n\n"
+            final = {"id": cid, "object": "response", "created_at": created, "status": "completed", "model": model, "output": [item]}
+            yield f"event: response.completed\ndata: {json.dumps(final)}\n\n"
     except ClearanceRequired:
         yield f"event: error\ndata: {json.dumps({'message': _CLEARANCE_HELP})}\n\n"
+        yield f"event: response.completed\ndata: {json.dumps({'id': cid, 'status': 'failed', 'error': {'message': _CLEARANCE_HELP}})}\n\n"
     except Exception as exc:
         yield f"event: error\ndata: {json.dumps({'message': str(exc)})}\n\n"
+        yield f"event: response.completed\ndata: {json.dumps({'id': cid, 'status': 'failed', 'error': {'message': str(exc)}})}\n\n"
     yield "data: [DONE]\n\n"
 
 
