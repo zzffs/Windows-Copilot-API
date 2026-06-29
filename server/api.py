@@ -147,6 +147,59 @@ def chat_completions(req: ChatCompletionRequest):
     return completion_response(reply.text, model, reply.conversation_id)
 
 
+@app.post("/v1/responses")
+def responses(req: dict):
+    """Minimal /v1/responses compatibility — translates to chat completions."""
+    model = req.get("model") or MODEL_NAME
+    inp = req.get("input", "")
+    if isinstance(inp, list):
+        texts = []
+        for msg in inp:
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                content = " ".join(
+                    c.get("text", "") for c in content if isinstance(c, dict)
+                )
+            texts.append(content)
+        prompt = "\n".join(texts)
+    else:
+        prompt = str(inp)
+    if not prompt.strip():
+        return JSONResponse(
+            status_code=400,
+            content={"error": {"message": "no text content", "type": "invalid_request_error"}},
+        )
+    limited = _rate_limited_response()
+    if limited is not None:
+        return limited
+    try:
+        with _upstream_lock:
+            reply = client.chat(prompt, conversation_id=req.get("conversation_id"))
+    except ClearanceRequired:
+        return JSONResponse(
+            status_code=503,
+            content={"error": {"message": _CLEARANCE_HELP, "type": "clearance_required"}},
+        )
+    except Exception as exc:
+        return JSONResponse(
+            status_code=502,
+            content={"error": {"message": str(exc), "type": "upstream_error"}},
+        )
+    return {
+        "id": f"resp_{reply.conversation_id or new_id()}",
+        "object": "response",
+        "status": "completed",
+        "model": model,
+        "output": [
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": reply.text, "annotations": []}],
+            }
+        ],
+    }
+
+
 @app.get("/")
 def root():
-    return {"service": "Copilot OpenAI-compatible API", "endpoints": ["/v1/models", "/v1/chat/completions"]}
+    return {"service": "Copilot OpenAI-compatible API", "endpoints": ["/v1/models", "/v1/chat/completions", "/v1/responses"]}
