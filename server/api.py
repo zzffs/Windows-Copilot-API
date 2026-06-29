@@ -148,9 +148,13 @@ def chat_completions(req: ChatCompletionRequest):
     return completion_response(reply.text, model, reply.conversation_id)
 
 
+import logging
+logger = logging.getLogger("uvicorn")
+
 @app.post("/v1/responses")
 def responses(req: dict):
     """Minimal /v1/responses compatibility — translates to chat completions."""
+    logger.info("responses request: stream=%s", req.get("stream"))
     model = req.get("model") or MODEL_NAME
     inp = req.get("input", "")
     if isinstance(inp, list):
