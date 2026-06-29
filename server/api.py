@@ -1,5 +1,6 @@
 """FastAPI app wiring Copilot onto the OpenAI Chat Completions API."""
 
+import json
 import threading
 import time
 
@@ -157,10 +158,11 @@ def responses(req: dict):
         for msg in inp:
             content = msg.get("content", "")
             if isinstance(content, list):
-                content = " ".join(
+                texts.append(" ".join(
                     c.get("text", "") for c in content if isinstance(c, dict)
-                )
-            texts.append(content)
+                ))
+            elif isinstance(content, str):
+                texts.append(content)
         prompt = "\n".join(texts)
     else:
         prompt = str(inp)
@@ -173,6 +175,11 @@ def responses(req: dict):
     if limited is not None:
         return limited
     try:
+        if req.get("stream"):
+            return StreamingResponse(
+                _responses_stream(prompt, model, req.get("conversation_id")),
+                media_type="text/event-stream",
+            )
         with _upstream_lock:
             reply = client.chat(prompt, conversation_id=req.get("conversation_id"))
     except ClearanceRequired:
@@ -185,19 +192,46 @@ def responses(req: dict):
             status_code=502,
             content={"error": {"message": str(exc), "type": "upstream_error"}},
         )
+    cid = f"resp_{reply.conversation_id or new_id()}"
+    created = int(time.time())
     return {
-        "id": f"resp_{reply.conversation_id or new_id()}",
+        "id": cid,
         "object": "response",
+        "created_at": created,
         "status": "completed",
+        "error": None,
         "model": model,
         "output": [
             {
                 "type": "message",
+                "id": f"msg_{new_id()}",
                 "role": "assistant",
                 "content": [{"type": "output_text", "text": reply.text, "annotations": []}],
             }
         ],
+        "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
     }
+
+
+def _responses_stream(prompt: str, model: str, conversation_id=None):
+    """Stream /v1/responses as SSE events."""
+    cid = f"resp_{new_id()}"
+    created = int(time.time())
+    try:
+        with _upstream_lock:
+            yield f"event: response.created\ndata: {json.dumps({'id': cid, 'object': 'response', 'created_at': created, 'model': model, 'status': 'in_progress'})}\n\n"
+            stream = client.stream(prompt, conversation_id=conversation_id)
+            msg_id = f"msg_{new_id()}"
+            yield f"event: response.output_item.added\ndata: {json.dumps({'id': msg_id, 'type': 'message', 'role': 'assistant', 'content': []})}\n\n"
+            for piece in stream:
+                if isinstance(piece, str) and piece:
+                    yield f"event: response.output_text.delta\ndata: {json.dumps({'id': msg_id, 'delta': piece})}\n\n"
+            yield f"event: response.completed\ndata: {json.dumps({'id': cid, 'object': 'response', 'created_at': created, 'status': 'completed', 'model': model, 'output': [{'id': msg_id, 'type': 'message', 'role': 'assistant', 'content': [{'type': 'output_text', 'text': stream.conversation_id or ''}]}]})}\n\n"
+    except ClearanceRequired:
+        yield f"event: error\ndata: {json.dumps({'message': _CLEARANCE_HELP})}\n\n"
+    except Exception as exc:
+        yield f"event: error\ndata: {json.dumps({'message': str(exc)})}\n\n"
+    yield "data: [DONE]\n\n"
 
 
 @app.get("/")
